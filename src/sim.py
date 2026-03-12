@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional
 import copy
+from rules import complement
 
 # ─────────────────────────────────────────────────────────────
 # Constants

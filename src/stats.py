@@ -177,11 +177,17 @@ def first_deriv_cen(
     sum2 += sumlenL * math.exp(-lam * cenL) \
           - sumlenH * math.exp(-lam * cenH)
 
-    if abs(sum2) < 1e-300:
-        # All exponential terms underflowed — lambda is too large.
-        # Return a large positive value to push Newton-Raphson to decrease lambda.
+    # Guard: if all exp() terms underflowed, sum2 will be near zero.
+    # sum2*sum2 underflows to 0.0 when sum2 < ~1e-154 (IEEE 754 double),
+    # so use 1e-150 as the threshold.  Return 1/lam (positive) so that
+    # Newton-Raphson will reduce lambda on the next step.
+    if abs(sum2) < 1e-150:
         return 1.0 / lam
-    return (1.0 / lam) - (total / float(stop - start)) + (sum1 / sum2)
+
+    try:
+        return (1.0 / lam) - (total / float(stop - start)) + (sum1 / sum2)
+    except ZeroDivisionError:
+        return 1.0 / lam
 
 
 def second_deriv_cen(
@@ -209,12 +215,16 @@ def second_deriv_cen(
     sum3 += sumlenL * cenL * cenL * math.exp(-lam * cenL) \
           - sumlenH * cenH * cenH * math.exp(-lam * cenH)
 
-    if abs(sum2) < 1e-300:
-        # All exponential terms underflowed — return a large negative value
-        # so Newton-Raphson treats this as a minimum (step back toward smaller lambda).
+    # Guard: sum2*sum2 underflows to 0.0 when sum2 < ~1e-154 (IEEE 754 double).
+    # Use 1e-150 as the safe threshold.  Return -(1/lam^2) so the
+    # Newton-Raphson step will halve lambda rather than divide by zero.
+    if abs(sum2) < 1e-150:
         return -(1.0 / (lam * lam))
-    return ((sum1 * sum1) / (sum2 * sum2)) - (sum3 / sum2) \
-           - (1.0 / (lam * lam))
+    try:
+        return ((sum1 * sum1) / (sum2 * sum2)) - (sum3 / sum2) \
+               - (1.0 / (lam * lam))
+    except ZeroDivisionError:
+        return -(1.0 / (lam * lam))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,20 +242,25 @@ def mle_cen(
     Returns (lambda, K) or None on failure.
     Python equivalent of the C function that returned a malloc'd double[2].
     """
+    import sys as _sys
+
     nf    = int((fc / 2.0) * n_len)
     start = nf
     stop  = n_len - nf
 
     st_sort(sptr)
 
-    # Trimmed mean & variance
-    sum_s = sum(float(sptr[i]) for i in range(start, stop))
-    dtmp  = float(stop - start)
-    mean_s = sum_s / dtmp
+    # ── trimmed variance ─────────────────────────────────────────────────────
+    dtmp   = float(stop - start)
+    sum_s  = sum(float(sptr[i]) for i in range(start, stop))
     sum2_s = sum(float(sptr[i]) ** 2 for i in range(start, stop))
     var_s  = sum2_s / (dtmp - 1.0)
 
-    # Censored tail sums
+    # Guard: zero variance (all scores identical) → can't fit EVD
+    if var_s <= 0.0:
+        return None
+
+    # ── censored-tail boundary values ────────────────────────────────────────
     sumlenL = sum(float(n1[i]) for i in range(start))
     sumlenH = sum(float(n1[i]) for i in range(stop, n_len))
 
@@ -256,38 +271,39 @@ def mle_cen(
         cenL = float(sptr[start]) / 2.0
         cenH = float(sptr[start]) * 2.0
 
+    # Guard: cenL must be strictly less than cenH
     if cenL >= cenH:
-        print("cenL is larger than cenH! mle_cen is wrong!")
-        return None
+        # Fall back to non-degenerate boundaries
+        cenL = float(sptr[start]) * 0.5
+        cenH = float(sptr[stop - 1]) * 2.0
+        if cenL >= cenH:
+            return None
 
+    # ── initial lambda estimate ───────────────────────────────────────────────
     lam = PI_SQRT6 / math.sqrt(var_s)
     if lam > 1.0:
-        import sys
-        print(f" Lambda initial estimate error: lambda: {lam:6.4g}; var_s: {var_s:6.4g}",
-              file=sys.stderr)
+        print(f" Lambda initial estimate error: lambda={lam:6.4g} var_s={var_s:6.4g}",
+              file=_sys.stderr)
         lam = 0.2
 
-    # Newton-Raphson
-    nit = 0
+    # ── Newton-Raphson ────────────────────────────────────────────────────────
+    nit     = 0
     old_lam = lam
     while True:
-        deriv  = first_deriv_cen( lam, sptr, n1, start, stop, sumlenL, cenL, sumlenH, cenH)
-        deriv2 = second_deriv_cen(lam, sptr, n1, start, stop, sumlenL, cenL, sumlenH, cenH)
+        deriv  = first_deriv_cen( lam, sptr, n1, start, stop,
+                                  sumlenL, cenL, sumlenH, cenH)
+        deriv2 = second_deriv_cen(lam, sptr, n1, start, stop,
+                                  sumlenL, cenL, sumlenH, cenH)
         old_lam = lam
-
-        # Guard: if second derivative is zero or tiny, halve lambda instead
-        if deriv2 == 0.0 or abs(deriv2) < 1e-300:
-            lam = lam / 2.0
-        else:
+        try:
             step = deriv / deriv2
             if lam - step > 0.0:
                 lam = lam - step
             else:
                 lam = lam / 2.0
-
-        # Clamp lambda to a sensible positive range to prevent underflow
-        lam = max(lam, 1e-6)
-
+        except ZeroDivisionError:
+            lam = lam / 2.0
+        lam = max(lam, 1e-9)
         nit += 1
         if not (abs((lam - old_lam) / lam) > TINY and nit < MAX_NIT):
             break
@@ -295,14 +311,21 @@ def mle_cen(
     if nit >= MAX_NIT:
         return None
 
+    # ── compute K ────────────────────────────────────────────────────────────
     total = sum(float(n1[i]) * math.exp(-lam * float(sptr[i]))
                 for i in range(start, stop))
 
-    K = float(n_len) / (float(m_len) * (
+    K_denom = float(m_len) * (
         total
         + sumlenL * math.exp(-lam * cenL)
         - sumlenH * math.exp(-lam * cenH)
-    ))
+    )
+
+    # Guard: avoid division by zero or negative denominator
+    if abs(K_denom) < 1e-300 or K_denom <= 0.0:
+        return None
+
+    K = float(n_len) / K_denom
     return (lam, K)
 
 
@@ -892,8 +915,14 @@ def calc_score(strA: str, strB: str, dnaStartPos: int, rule: int) -> int:
         return 0
 
     lambda_tmp, K_tmp = mle_rst
+
+    # Guard: K_tmp, n1, n0 must all be positive for log() to be valid
+    log_arg = K_tmp * n1 * n0
+    if log_arg <= 0.0 or lambda_tmp <= 0.0:
+        return 0
+
     mle_thresh = int(
-        (math.log(K_tmp * n1 * n0) - math.log(10.0)) / lambda_tmp + 0.5
+        (math.log(log_arg) - math.log(10.0)) / lambda_tmp + 0.5
     )
 
     close_work_f_str(f_str0)
