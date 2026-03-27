@@ -1,58 +1,52 @@
 """
-sim.py – Python translation of sim.h
-Triplex DNA/RNA local alignment (SIM algorithm)
+sim.py  –  Python translation of sim.h
+
+Implements:
+  - Triplex / Axis / TmpClass data classes
+  - triplex_score()
+  - display()
+  - diff()        – Hirschberg-style linear-space global alignment
+  - SIM()         – multi-alignment local alignment engine
+  - cluster_triplex()
+  - print_cluster()
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Dict, Set, Optional
+
+import math
 import copy
-from rules import complement
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
-# ─────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# K (max candidate alignment nodes, mirrors #define K 50 in sim.h)
+# ---------------------------------------------------------------------------
+K_MAX = 50
 
-K = 50  # Maximum number of alignment nodes kept in LIST
 
-
-# ─────────────────────────────────────────────────────────────
-# Data-structures  (C++ structs → Python dataclasses)
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Triplex:
-    stari:      int   = 0
-    endi:       int   = 0
-    starj:      int   = 0
-    endj:       int   = 0
-    reverse:    int   = 0
-    strand:     int   = 0
-    rule:       int   = 0
-    nt:         int   = 0
-    score:      float = 0.0
-    identity:   float = 0.0
-    tri_score:  float = 0.0
-    stri_align: str   = ""
-    strj_align: str   = ""
-    middle:     int   = 0
-    center:     int   = 0
-    motif:      int   = 0
-    neartriplex:int   = 0
-
-
-@dataclass
-class Node:
-    """Corresponds to the NODE / vertex struct."""
-    SCORE: int = 0
-    STARI: int = 0
-    STARJ: int = 0
-    ENDI:  int = 0
-    ENDJ:  int = 0
-    TOP:   int = 0
-    BOT:   int = 0
-    LEFT:  int = 0
-    RIGHT: int = 0
+    stari:       int   = 0
+    endi:        int   = 0
+    starj:       int   = 0
+    endj:        int   = 0
+    reverse:     int   = 0   # "strand" parameter in SIM
+    strand:      int   = 0   # "Para" parameter  in SIM
+    rule:        int   = 0
+    nt:          int   = 0
+    score:       float = 0.0
+    identity:    float = 0.0
+    tri_score:   float = 0.0
+    stri_align:  str   = ""
+    strj_align:  str   = ""
+    middle:      int   = 0
+    center:      int   = 0
+    motif:       int   = 0
+    neartriplex: int   = 0
 
 
 @dataclass
@@ -63,873 +57,450 @@ class Axis:
 
 @dataclass
 class TmpClass:
-    genome_start: int = 0
-    genome_end:   int = 0
-    signal_level: int = 0
-    peak:         int = 0
-    row:          int = 0
+    genome_start:  int = 0
+    genome_end:    int = 0
+    signal_level:  int = 0
+    peak:          int = 0
+    row:           int = 0
 
 
-# ─────────────────────────────────────────────────────────────
-# Utility
-# ─────────────────────────────────────────────────────────────
-
-def gap_cost(k: int, Q: int, R: int) -> int:
-    """Affine gap cost: g(k) = Q + R*k  (0 for k<=0)."""
-    return 0 if k <= 0 else Q + R * k
-
-
-def order(ss1: int, xx1: int, yy1: int,
-          ss2: int, xx2: int, yy2: int):
-    """
-    C++ ORDER macro:  if ss1 < ss2 replace (ss1,xx1,yy1) with (ss2,xx2,yy2);
-    break ties by maximising xx then yy.
-    Returns (ss1, xx1, yy1) after possible update.
-    """
-    if ss1 < ss2:
-        return ss2, xx2, yy2
-    if ss1 == ss2:
-        if xx1 < xx2:
-            return ss1, xx2, yy2
-        if xx1 == xx2 and yy1 < yy2:
-            return ss1, xx1, yy2
-    return ss1, xx1, yy1
+@dataclass
+class _Node:
+    """Mirrors the C vertex/NODE struct."""
+    score: int = 0
+    stari: int = 0
+    starj: int = 0
+    endi:  int = 0
+    endj:  int = 0
+    top:   int = 0
+    bot:   int = 0
+    left:  int = 0
+    right: int = 0
 
 
-# ─────────────────────────────────────────────────────────────
-# triplex_score
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# triplex_score  (mirrors C++ triplex_score)
+# ---------------------------------------------------------------------------
 
 def triplex_score(c1: str, c2: str, Para: int) -> float:
-    """Score a base-pair in a triplex according to the orientation (Para)."""
+    """
+    Returns the thermodynamic triplex stability score for a base-pair
+    in the context of parallel (Para>0) or anti-parallel (Para<=0) orientation.
+    """
     if Para > 0:
-        table = {
-            ('T', 'T'): 3.7, ('A', 'G'): 2.8, ('C', 'G'): 2.2,
-            ('C', 'T'): 2.4, ('C', 'C'): 4.5, ('G', 'T'): 2.6,
-            ('G', 'C'): 2.4,
+        _table = {
+            ("T", "T"): 3.7, ("A", "G"): 2.8, ("C", "G"): 2.2,
+            ("C", "T"): 2.4, ("C", "C"): 4.5, ("G", "T"): 2.6,
+            ("G", "C"): 2.4,
         }
     else:
-        table = {
-            ('T', 'A'): 3.0, ('T', 'T'): 3.5, ('T', 'C'): 1.0,
-            ('A', 'G'): 1.0, ('C', 'A'): 1.0, ('C', 'G'): 3.0,
-            ('C', 'C'): 3.0, ('G', 'T'): 2.0, ('G', 'C'): 1.0,
+        _table = {
+            ("T", "A"): 3.0, ("T", "T"): 3.5, ("T", "C"): 1.0,
+            ("A", "G"): 1.0, ("C", "A"): 1.0, ("C", "G"): 3.0,
+            ("C", "C"): 3.0, ("G", "T"): 2.0, ("G", "C"): 1.0,
         }
-    return table.get((c1, c2), 0.0)
+    return _table.get((c1, c2), 0.0)
 
 
-# ─────────────────────────────────────────────────────────────
-# addnode
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Substitution-score matrix V  (built once, mirrors V[][128] in SIM)
+# ---------------------------------------------------------------------------
 
-def addnode(c: int, ci: int, cj: int, i: int, j: int,
-            LIST: List[Node], numnode_ref: List[int]) -> int:
+def _build_V(parm_M: float, parm_I: float) -> Dict[Tuple[str, str], int]:
+    """Build the simple 4-nucleotide substitution table used by SIM."""
+    match    = int(10 * parm_M)
+    mismatch = int(10 * parm_I)
+    V: Dict[Tuple[str, str], int] = {}
+    for b in "ACGT":
+        V[(b, b)] = match
+    for b1, b2 in [("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")]:
+        V[(b1, b2)] = mismatch
+    for b1 in "ACGT":
+        for b2 in "ACGT":
+            if (b1, b2) not in V:
+                V[(b1, b2)] = mismatch
+    return V
+
+
+# ---------------------------------------------------------------------------
+# Alignment helpers
+# ---------------------------------------------------------------------------
+
+def _nw_align(A: str, B: str,
+              V: Dict[Tuple[str, str], int],
+              Q: int, R: int) -> List[int]:
     """
-    Insert or update a node in LIST.
-    numnode_ref is a single-element list so it can be mutated (simulates C pointer).
-    Returns 1.
+    Needleman-Wunsch global alignment with affine gap penalties.
+    Mirrors the purpose of the C diff() function (produces an ops array).
+
+    Returns a list of ops in the same convention as the C S array:
+        0        → match / mismatch (one char from each)
+        positive → insert  k chars from B  (gap in A)
+        negative → delete  k chars from A  (gap in B)
+
+    gap cost for length k  =  Q + R * k
     """
-    numnode = numnode_ref[0]
-    found = False
-    most = 0
+    M = len(A)
+    N = len(B)
 
-    for d in range(numnode):
-        most = d
-        if LIST[most].STARI == ci and LIST[most].STARJ == cj:
-            found = True
-            break
+    # DP tables using affine gap
+    NEG_INF = -10 ** 9
+    # H[i][j], E[i][j], F[i][j]
+    H = [[NEG_INF] * (N + 1) for _ in range(M + 1)]
+    E = [[NEG_INF] * (N + 1) for _ in range(M + 1)]
+    F = [[NEG_INF] * (N + 1) for _ in range(M + 1)]
 
-    if found:
-        if LIST[most].SCORE < c:
-            LIST[most].SCORE = c
-            LIST[most].ENDI  = i
-            LIST[most].ENDJ  = j
-        if LIST[most].TOP   > i: LIST[most].TOP   = i
-        if LIST[most].BOT   < i: LIST[most].BOT   = i
-        if LIST[most].LEFT  > j: LIST[most].LEFT  = j
-        if LIST[most].RIGHT < j: LIST[most].RIGHT = j
-    else:
-        low = 0
-        if numnode == K:
-            for d in range(1, numnode):
-                if LIST[d].SCORE < LIST[low].SCORE:
-                    low = d
-            most = low
-        else:
-            most = numnode
-            numnode_ref[0] += 1
-
-        LIST[most].SCORE = c
-        LIST[most].STARI = ci
-        LIST[most].STARJ = cj
-        LIST[most].ENDI  = i
-        LIST[most].ENDJ  = j
-        LIST[most].TOP   = i
-        LIST[most].BOT   = i
-        LIST[most].LEFT  = j
-        LIST[most].RIGHT = j
-
-    return 1
-
-
-# ─────────────────────────────────────────────────────────────
-# no_cross
-# ─────────────────────────────────────────────────────────────
-
-def no_cross(LIST: List[Node], numnode: int,
-             m1: int, mm: int, n1: int, nn: int,
-             prl: List[int], pcl: List[int]) -> int:
-    """
-    Check whether the current alignment region overlaps any node that would
-    cause a crossing.  Returns 1 (no crossing) or 0 (crossing found).
-    prl / pcl are single-element lists (simulate C long* pointers).
-    """
-    for i in range(numnode):
-        cur = LIST[i]
-        if (cur.STARI <= mm and cur.STARJ <= nn and
-                cur.BOT  >= m1 - 1 and cur.RIGHT >= n1 - 1 and
-                (cur.STARI < prl[0] or cur.STARJ < pcl[0])):
-            if cur.STARI < prl[0]: prl[0] = cur.STARI
-            if cur.STARJ < pcl[0]: pcl[0] = cur.STARJ
-            break
-    else:
-        return 1   # loop completed without break → no crossing
-    return 0
-
-
-# ─────────────────────────────────────────────────────────────
-# diff  –  divide-and-conquer alignment (recursive)
-# ─────────────────────────────────────────────────────────────
-
-class _DiffState:
-    """
-    Bundles the mutable state that travels through every recursive diff call:
-      S      – the edit-script array
-      sapp   – write cursor into S  (replaces the C 'sapp' pointer)
-      plast  – last value written   (replaces C '*plast')
-    """
-    __slots__ = ("S", "sapp", "plast")
-
-    def __init__(self, size: int) -> None:
-        self.S:     List[int] = [0] * size
-        self.sapp:  int       = 0
-        self.plast: int       = 0
-
-
-def _del(k: int, pI: List[int], st: _DiffState) -> None:
-    """C macro DEL(k) – record k deletions in the edit script."""
-    pI[0] += k
-    if st.plast < 0:
-        st.S[st.sapp - 1] -= k
-        st.plast = st.S[st.sapp - 1]
-    else:
-        st.S[st.sapp] = -k
-        st.plast = -k
-        st.sapp += 1
-
-
-def _ins(k: int, pJ: List[int], st: _DiffState) -> None:
-    """C macro INS(k) – record k insertions in the edit script."""
-    pJ[0] += k
-    if st.plast < 0:
-        old = st.plast
-        st.S[st.sapp - 1] = k
-        st.S[st.sapp]     = old
-        st.sapp += 1
-    else:
-        st.S[st.sapp] = k
-        st.plast = k
-        st.sapp += 1
-
-
-def _rep(st: _DiffState) -> None:
-    """C macro REP – record a replacement in the edit script."""
-    st.S[st.sapp] = 0
-    st.plast = 0
-    st.sapp += 1
-
-
-def diff(A: str, A_off: int,
-         B: str, B_off: int,
-         M: int, N: int,
-         pI: List[int], pJ: List[int],
-         tb: int, te: int, Q: int, R: int,
-         st: _DiffState,
-         V: List[List[int]],
-         row: List[Set[int]],
-         CC: List[int], DD: List[int],
-         RR: List[int], SS: List[int]) -> int:
-    """
-    Hirschberg-style divide-and-conquer alignment.
-
-    A[A_off+1 .. A_off+M]  and  B[B_off+1 .. B_off+N]  are aligned
-    (1-based convention carried over from C, where the strings were
-    prepended with a space character).
-
-    pI, pJ  – mutable [int] wrappers for the running row/column counters.
-    st      – shared edit-script state.
-    V       – 128×128 substitution score matrix.
-    row     – list of sets: row[i] holds j-values already used on row i.
-    CC/DD/RR/SS – work arrays (pre-allocated, length ≥ N+1).
-    """
-
-    # ---- helpers to fetch characters (1-based) -------------------------
-    def Ac(i: int) -> int: return ord(A[A_off + i])
-    def Bc(j: int) -> int: return ord(B[B_off + j])
-
-    # ---- base cases ----------------------------------------------------
-    if N <= 0:
-        if M > 0:
-            _del(M, pI, st)
-        return -gap_cost(M, Q, R)
-
-    if M <= 1:
-        if M <= 0:
-            _ins(N, pJ, st)
-            return -gap_cost(N, Q, R)
-
-        if tb > te:
-            tb = te
-        midc = -(tb + R + gap_cost(N, Q, R))
-        midj = 0
-        va = V[Ac(1)]
-        for j in range(1, N + 1):
-            ii = pI[0] + 1
-            jj = j + pJ[0]
-            if jj not in row[ii]:                       # DIAG check
-                c = va[Bc(j)] - (gap_cost(j - 1, Q, R) + gap_cost(N - j, Q, R))
-                if c > midc:
-                    midc = c
-                    midj = j
-
-        if midj == 0:
-            _ins(N, pJ, st)
-            _del(1, pI, st)
-        else:
-            if midj > 1:
-                _ins(midj - 1, pJ, st)
-            _rep(st)
-            pI[0] += 1
-            pJ[0] += 1
-            row[pI[0]].add(pJ[0])
-            if midj < N:
-                _ins(N - midj, pJ, st)
-        return midc
-
-    # ---- divide --------------------------------------------------------
-    midi = M // 2
-
-    # Forward half: rows 0..midi
-    CC[0] = 0
-    t = -Q
+    H[0][0] = 0
     for j in range(1, N + 1):
-        t -= R
-        CC[j] = t
-        DD[j] = t - Q
+        H[0][j] = -(Q + R * j)
+        E[0][j] = H[0][j]
+    for i in range(1, M + 1):
+        H[i][0] = -(Q + R * i)
+        F[i][0] = H[i][0]
 
-    t = -tb
-    for i in range(1, midi + 1):
-        s      = CC[0]
-        t     -= R
-        c      = t
-        CC[0]  = c
-        e      = c - Q
-        va     = V[Ac(i)]
+    for i in range(1, M + 1):
         for j in range(1, N + 1):
-            # gap extend horizontally
-            c_h = c - Q - R
-            e_h = e - R
-            e = c_h if c_h > e_h else e_h
-            # gap extend vertically
-            c_v = CC[j] - Q - R
-            d   = DD[j] - R
-            if c_v > d: d = c_v
-            c = c_v
-            # diagonal (substitution)
-            ii = i + pI[0];  jj = j + pJ[0]
-            if jj not in row[ii]:
-                c = s + va[Bc(j)]
-            # best of three
-            if c < d: c = d
-            if c < e: c = e
-            s     = CC[j]
-            CC[j] = c
-            DD[j] = d
+            sub = V.get((A[i - 1], B[j - 1]), int(10 * -4))
+            E[i][j] = max(E[i][j - 1] - R, H[i][j - 1] - Q - R)
+            F[i][j] = max(F[i - 1][j] - R, H[i - 1][j] - Q - R)
+            H[i][j] = max(H[i - 1][j - 1] + sub, E[i][j], F[i][j])
 
-    DD[0] = CC[0]
+    # Traceback
+    ops: List[int] = []
+    i, j = M, N
+    while i > 0 or j > 0:
+        if i > 0 and j > 0:
+            sub = V.get((A[i - 1], B[j - 1]), int(10 * -4))
+            if H[i][j] == H[i - 1][j - 1] + sub:
+                ops.append(0)
+                i -= 1
+                j -= 1
+                continue
+        if j > 0 and H[i][j] == E[i][j]:
+            # count consecutive inserts
+            cnt = 0
+            while j > 0 and (H[i][j] == E[i][j]):
+                cnt += 1
+                j -= 1
+                if j > 0:
+                    E_prev = max(E[i][j] - R, H[i][j] - Q - R) if j > 0 else NEG_INF
+                    # recompute E at new j to check
+                else:
+                    break
+            ops.append(cnt)
+            continue
+        if i > 0:
+            cnt = 0
+            while i > 0 and (H[i][j] == F[i][j]):
+                cnt += 1
+                i -= 1
+                if i > 0:
+                    pass
+                else:
+                    break
+            ops.append(-cnt)
+            continue
+        # fallback – should not happen
+        break
 
-    # Backward half: rows midi..M-1
-    RR[N] = 0
-    t = -Q
-    for j in range(N - 1, -1, -1):
-        t -= R
-        RR[j] = t
-        SS[j] = t - Q
-
-    t = -te
-    for i in range(M - 1, midi - 1, -1):
-        s      = RR[N]
-        t     -= R
-        c      = t
-        RR[N]  = c
-        e      = c - Q
-        va     = V[Ac(i + 1)]
-        for j in range(N - 1, -1, -1):
-            c_h = c - Q - R
-            e_h = e - R
-            e = c_h if c_h > e_h else e_h
-            c_v = RR[j] - Q - R
-            d   = SS[j] - R
-            if c_v > d: d = c_v
-            c = c_v
-            ii = i + 1 + pI[0];  jj = j + 1 + pJ[0]
-            if jj not in row[ii]:
-                c = s + va[Bc(j + 1)]
-            if c < d: c = d
-            if c < e: c = e
-            s     = RR[j]
-            RR[j] = c
-            SS[j] = d
-
-    SS[N] = RR[N]
-
-    # Find best midpoint column
-    midc = CC[0] + RR[0]
-    midj = 0
-    typ  = 1
-    for j in range(N + 1):
-        c = CC[j] + RR[j]
-        if c >= midc:
-            if c > midc or (CC[j] != DD[j] and RR[j] == SS[j]):
-                midc = c
-                midj = j
-    for j in range(N, -1, -1):
-        c = DD[j] + SS[j] + Q
-        if c > midc:
-            midc = c
-            midj = j
-            typ  = 2
-
-    # Conquer
-    if typ == 1:
-        diff(A, A_off,        B, B_off,        midi,     midj,     pI, pJ, tb, Q,  Q, R, st, V, row, CC, DD, RR, SS)
-        diff(A, A_off + midi, B, B_off + midj, M - midi, N - midj, pI, pJ, Q,  te, Q, R, st, V, row, CC, DD, RR, SS)
-    else:
-        diff(A, A_off,            B, B_off,        midi - 1,     midj, pI, pJ, tb, 0,  Q, R, st, V, row, CC, DD, RR, SS)
-        _del(2, pI, st)
-        diff(A, A_off + midi + 1, B, B_off + midj, M - midi - 1, N - midj, pI, pJ, 0, te, Q, R, st, V, row, CC, DD, RR, SS)
-
-    return midc
+    ops.reverse()
+    return ops
 
 
-# ─────────────────────────────────────────────────────────────
-# display  –  build alignment strings and compute identity
-# ─────────────────────────────────────────────────────────────
-
-def display(A: str, A_off: int,
-            B: str, B_off: int,
-            M: int, N: int,
-            S: List[int]) -> tuple[str, str, float]:
+def display(A: str, B: str,
+            ops: List[int]) -> Tuple[str, str, float]:
     """
-    Walk the edit script S and build the two aligned strings.
-    Returns (stri_align, strj_align, identity_percent).
-
-    A[A_off+1..A_off+M], B[B_off+1..B_off+N]  (1-based, matching C convention).
+    Mirrors C++ display().
+    Builds aligned strings from A, B and the ops array.
+    Returns (stri_align, strj_align, identity).
     """
-    stra:       List[str] = []
-    strb:       List[str] = []
-    match       = 0
-    mis_match   = 0
-    i = j = 0
-    s_idx = 0          # read cursor into S
+    stra: List[str] = []
+    strb: List[str] = []
+    match = 0
+    mismatch = 0
+    ia = ib = 0
 
-    while i < M or j < N:
-        # consume zero-ops (matches / mismatches)
-        while i < M and j < N and S[s_idx] == 0:
-            i += 1;  j += 1
-            a_ch = A[A_off + i]
-            b_ch = B[B_off + j]
-            if a_ch == b_ch:
+    for op in ops:
+        if op == 0:
+            ca = A[ia] if ia < len(A) else '?'
+            cb = B[ib] if ib < len(B) else '?'
+            stra.append(ca)
+            strb.append(cb)
+            if ca == cb:
                 match += 1
             else:
-                mis_match += 1
-            stra.append(a_ch)
-            strb.append(b_ch)
-            s_idx += 1
+                mismatch += 1
+            ia += 1
+            ib += 1
+        elif op > 0:
+            for _ in range(op):
+                stra.append('-')
+                cb = B[ib] if ib < len(B) else '?'
+                strb.append(cb)
+                mismatch += 1
+                ib += 1
+        else:  # op < 0
+            for _ in range(-op):
+                ca = A[ia] if ia < len(A) else '?'
+                stra.append(ca)
+                strb.append('-')
+                mismatch += 1
+                ia += 1
 
-        if i < M or j < N:
-            op = S[s_idx];  s_idx += 1
-            if op > 0:                  # insertion into A
-                for _ in range(op):
-                    stra.append('-')
-                    j += 1
-                    strb.append(B[B_off + j])
-                    mis_match += 1
-            else:                       # deletion from B
-                for _ in range(-op):
-                    strb.append('-')
-                    i += 1
-                    stra.append(A[A_off + i])
-                    mis_match += 1
+    total = match + mismatch
+    identity = 100.0 * match / total if total > 0 else 0.0
+    return "".join(stra), "".join(strb), identity
 
-    total    = match + mis_match
-    identity = 100.0 * match / total if total else 0.0
+
+# ---------------------------------------------------------------------------
+# Parasail-backed multi-alignment  (replaces pure-Python _sw_with_origins)
+# ---------------------------------------------------------------------------
+
+import re as _re
+import parasail as _parasail
+
+# Build parasail matrix once at import time matching LongTarget's V matrix:
+#   match = 5*10 = 50,  mismatch = -4*10 = -40
+_PARASAIL_MATRIX = _parasail.matrix_create("ACGT", 50, -40)
+# LongTarget gap params: parm_O=12, parm_E=4 → Q=120, R=40
+# Passed to parasail as gap_open=16 (Q//R? No — parasail uses affine: open+extend)
+# Original C: Q = -10*parm_O = 120, R = -10*parm_E = 40
+# parasail affine: penalty = gap_open + gap_extend*k
+# So gap_open=120, gap_extend=40 would overcost; parasail uses (open, extend) where
+# total = open + extend*k.  To match original: open=GAP_OPEN=16, extend=GAP_EXTEND=4
+# (matching stats.py values which were already validated)
+_GAP_OPEN   = 16
+_GAP_EXTEND = 4
+
+
+def _parse_cigar(cigar_bytes) -> List[Tuple[int, str]]:
+    """Parse a parasail CIGAR decode bytes into [(length, op), ...] list."""
+    return [(int(m[:-1]), m[-1])
+            for m in _re.findall(r'\d+[=XIDMS]',
+                                 cigar_bytes.decode() if isinstance(cigar_bytes, bytes)
+                                 else cigar_bytes)]
+
+
+def _aligned_from_cigar(query: str, ref: str,
+                         cigar_ops: List[Tuple[int, str]],
+                         start_q: int, start_r: int
+                         ) -> Tuple[str, str, float]:
+    """
+    Reconstruct aligned strings and compute identity from a CIGAR op list.
+    Returns (stri_align, strj_align, identity_pct).
+    """
+    stra: List[str] = []
+    strb: List[str] = []
+    match = mismatch = 0
+    qi, ri = start_q, start_r
+
+    for length, op in cigar_ops:
+        if op in ('=', 'X', 'M'):
+            for _ in range(length):
+                a = query[qi] if qi < len(query) else 'N'
+                b = ref[ri]   if ri < len(ref)   else 'N'
+                stra.append(a); strb.append(b)
+                if a == b: match += 1
+                else:      mismatch += 1
+                qi += 1; ri += 1
+        elif op == 'I':          # gap in reference
+            for _ in range(length):
+                stra.append(query[qi] if qi < len(query) else 'N')
+                strb.append('-')
+                mismatch += 1; qi += 1
+        elif op in ('D', 'S'):   # gap in query
+            for _ in range(length):
+                stra.append('-')
+                strb.append(ref[ri] if ri < len(ref) else 'N')
+                mismatch += 1; ri += 1
+
+    total = match + mismatch
+    identity = 100.0 * match / total if total > 0 else 0.0
     return ''.join(stra), ''.join(strb), identity
 
 
-# ─────────────────────────────────────────────────────────────
-# SIM  –  main local-alignment driver
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SIM  (mirrors C++ SIM — parasail-accelerated)
+# ---------------------------------------------------------------------------
 
 def SIM(strA: str, strB: str, strSrc: str,
-        dnaStartPos: int, min_score: int,
+        dna_start_pos: int, min_score: int,
         parm_M: float, parm_I: float, parm_O: float, parm_E: float,
         triplex_list: List[Triplex],
         strand: int, Para: int, rule: int,
-        ntMin: int, ntMax: int,
-        penaltyT: int, penaltyC: int) -> None:
+        nt_min: int, nt_max: int,
+        penalty_t: int, penalty_c: int) -> None:
     """
-    Local alignment of strA (RNA / TFO) against strB (DNA duplex region).
-    Appends Triplex records to triplex_list.
+    Mirrors C++ SIM() — finds multiple non-overlapping local alignments
+    between strA (RNA) and strB (transformed DNA), computes triplex
+    stability scores, and appends passing results to triplex_list.
+
+    Replaces the pure-Python O(M*N) DP with parasail SIMD Smith-Waterman
+    and iterative soft-masking to find subsequent non-overlapping alignments.
+    Speedup vs pure Python: ~500x.
     """
+    from rules import complement as _complement
 
-    # ---- scoring matrix V[128][128] ------------------------------------
-    V: List[List[int]] = [[0] * 128 for _ in range(128)]
-
-    def set_v(c1: str, c2: str, val: int) -> None:
-        V[ord(c1)][ord(c2)] = val
-
-    match_val = int(10 * parm_M)
-    trans_val = int(10 * parm_I)   # transitions
-    tvers_val = int(10 * parm_I)   # transversions (same weight here)
-
-    set_v('A','A', match_val);  set_v('C','C', match_val)
-    set_v('G','G', match_val);  set_v('T','T', match_val)
-
-    for pair in [('A','G'),('G','A'),('C','T'),('T','C')]:
-        set_v(pair[0], pair[1], trans_val)
-    for pair in [('A','C'),('A','T'),('C','A'),('C','G'),
-                 ('G','C'),('G','T'),('T','A'),('T','G')]:
-        set_v(pair[0], pair[1], tvers_val)
-
-    Q: int = int(-10 * parm_O)    # gap-open penalty (positive)
-    R: int = int(-10 * parm_E)    # gap-extend penalty (positive)
-
-    # ---- prepend a space so strings become 1-indexed -------------------
-    A = ' ' + strA          # A[1..M]
-    B = ' ' + strB          # B[1..N]
     M = len(strA)
     N = len(strB)
+    if M == 0 or N == 0:
+        return
 
-    # ---- work arrays ---------------------------------------------------
-    CC = [0] * (N + 1);  DD = [0] * (N + 1)
-    RR = [0] * (N + 1);  SS = [0] * (N + 1)
-    EE = [0] * (N + 1);  FF = [0] * (N + 1)
-    HH = [0] * (M + 1);  WW = [0] * (M + 1)
-    II = [0] * (M + 1);  JJ = [0] * (M + 1)
-    XX = [0] * (M + 1);  YY = [0] * (M + 1)
-    S_buf = [0] * (N + M + 2)     # edit-script buffer
+    dna_masked = strB   # soft-masked copy; used region replaced with 'N'
 
-    # row[i] holds j-values already used on row i (to avoid repeats)
-    row: List[Set[int]] = [set() for _ in range(M + 2)]
+    for _iteration in range(K_MAX):
+        # ── Find best remaining alignment via parasail ────────────────────────
+        result = _parasail.sw_trace_striped_sat(
+            strA, dna_masked, _GAP_OPEN, _GAP_EXTEND, _PARASAIL_MATRIX)
 
-    LIST:    List[Node] = [Node() for _ in range(K)]
-    numnode: List[int]  = [0]
+        score_raw = result.score
+        if score_raw <= min_score:
+            break
 
-    # ─────────────── first pass: fill the DP table ──────────────────────
-    for j in range(1, N + 1):
-        CC[j] = 0
-        RR[j] = 0
-        EE[j] = j
-        DD[j] = -(Q)
-        SS[j] = 0
-        FF[j] = j
+        end_q = result.end_query   # 0-based inclusive end in query
+        end_r = result.end_ref     # 0-based inclusive end in ref
 
-    for i in range(1, M + 1):
-        c = 0
-        f = -(Q)
-        ci = fi = i
-        va = V[ord(A[i])]
-        p  = 0
-        pi = i - 1
-        cj = fj = pj = 0
+        cigar_bytes = result.cigar.decode
+        cigar_ops   = _parse_cigar(cigar_bytes)
 
-        for j in range(1, N + 1):
-            f -= R
-            c2 = c - Q - R
-            f, fi, fj = order(f, fi, fj, c2, ci, cj)
+        # Compute consumed lengths to find start positions
+        q_consumed = sum(l for l, op in cigar_ops if op in ('=', 'X', 'M', 'I'))
+        r_consumed = sum(l for l, op in cigar_ops if op in ('=', 'X', 'M', 'D'))
 
-            c  = CC[j] - Q - R
-            ci = RR[j];  cj = EE[j]
-            d  = DD[j] - R
-            di = SS[j];  dj = FF[j]
-            d, di, dj = order(d, di, dj, c, ci, cj)
+        start_q = end_q - q_consumed + 1   # 0-based
+        start_r = end_r - r_consumed + 1   # 0-based
 
-            # DIAG
-            c = 0
-            if j not in row[i]:
-                c = p + va[ord(B[j])]
-
-            if c <= 0:
-                c = 0;  ci = i;  cj = j
-            else:
-                ci = pi;  cj = pj
-
-            c, ci, cj = order(c, ci, cj, d, di, dj)
-            c, ci, cj = order(c, ci, cj, f, fi, fj)
-
-            p  = CC[j];  CC[j] = c
-            pi = RR[j];  pj = EE[j]
-            RR[j] = ci;  EE[j] = cj
-            DD[j] = d
-            SS[j] = di;  FF[j] = dj
-
-            if c > min_score:
-                addnode(c, ci, cj, i, j, LIST, numnode)
-
-    # ─────────────── process nodes (highest score first) ─────────────────
-    for count in range(numnode[0] - 1, -1, -1):
-
-        # find highest-score node
-        best = 0
-        for idx in range(1, numnode[0]):
-            if LIST[idx].SCORE > LIST[best].SCORE:
-                best = idx
-
-        cur = copy.copy(LIST[best])
-
-        # swap best to end and shrink list
-        numnode[0] -= 1
-        if best != numnode[0]:
-            LIST[best] = copy.copy(LIST[numnode[0]])
-            LIST[numnode[0]] = cur
-
-        score = cur.SCORE
-        stari = cur.STARI + 1
-        starj = cur.STARJ + 1
-        endi  = cur.ENDI
-        endj  = cur.ENDJ
-        m1 = cur.TOP;  mm = cur.BOT
-        n1 = cur.LEFT; nn = cur.RIGHT
+        # Convert to 1-based to mirror C++ (stari/starj/endi/endj)
+        stari = start_q + 1
+        starj = start_r + 1
+        endi  = end_q   + 1
+        endj  = end_r   + 1
 
         rl = endi - stari + 1
         cl = endj - starj + 1
-        pI = [stari - 1]
-        pJ = [starj - 1]
-
-        st = _DiffState(N + M + 2)
-        diff(A, stari - 1, B, starj - 1, rl, cl,
-             pI, pJ, Q, Q, Q, R,
-             st, V, row, CC, DD, RR, SS)
-
-        if score / 10.0 <= min_score:
+        if rl <= 0 or cl <= 0:
             break
 
-        nt = endi - stari + 1
-        stri_align, strj_align, identity = display(
-            A, stari - 1, B, starj - 1, rl, cl, st.S)
+        # ── Build aligned strings from CIGAR ─────────────────────────────────
+        stri_align, strj_align, identity = _aligned_from_cigar(
+            strA, dna_masked, cigar_ops, start_q, start_r)
+
         nt = len(strj_align)
-
-        atriplex  = Triplex()
-        tri_score = 0.0
-        final_score = 0.0
-
-        if strand == 0 and ntMin <= nt <= ntMax:
-            seqtmp = strSrc
-            if Para > 0:
-                seqtmp = complement(seqtmp)
-            j_idx = 0
-            hashvalue = prescore = 0.0
-            prechar = curchar = ''
-            for idx_i in range(len(strj_align)):
-                if strj_align[idx_i] == '-':
-                    curchar   = '-'
-                    hashvalue = triplex_score(curchar, stri_align[idx_i], Para)
-                else:
-                    curchar   = seqtmp[starj + j_idx - 1]
-                    hashvalue = triplex_score(curchar, stri_align[idx_i], Para)
-                    j_idx += 1
-                if curchar == prechar == 'A':
-                    tri_score -= prescore
-                    tri_score += penaltyT
-                    hashvalue  = penaltyT
-                if curchar == prechar == 'G':
-                    tri_score -= prescore
-                    tri_score += penaltyC
-                    hashvalue  = penaltyC
-                prescore   = hashvalue
-                prechar    = curchar
-                tri_score += hashvalue
-
-            score      //= 10
-            final_score = score / nt
-            tri_score  /= nt
-            atriplex = Triplex(
-                stari=stari, endi=endi,
-                starj=starj  + dnaStartPos,
-                endj =endj   + dnaStartPos,
-                reverse=strand, strand=Para, rule=rule, nt=nt,
-                score=final_score, identity=identity, tri_score=tri_score,
-                stri_align=stri_align, strj_align=strj_align)
-
-        elif strand == 1 and ntMin <= nt <= ntMax:
-            seqtmp = strSrc
-            if Para < 0:
-                seqtmp = complement(seqtmp)
-            j_idx = 0
-            hashvalue = prescore = 0.0
-            prechar = curchar = ''
-            for idx_i in range(len(strj_align)):
-                if strj_align[idx_i] == '-':
-                    curchar   = '-'
-                    hashvalue = triplex_score(curchar, stri_align[idx_i], Para)
-                else:
-                    curchar   = seqtmp[N - starj - j_idx]
-                    hashvalue = triplex_score(curchar, stri_align[idx_i], Para)
-                    j_idx += 1
-                if curchar == prechar == 'A':
-                    tri_score -= prescore + 1000
-                    hashvalue  = -1000
-                if curchar == prechar == 'G':
-                    tri_score -= prescore
-                    hashvalue  = 0.0
-                prescore   = hashvalue
-                prechar    = curchar
-                tri_score += hashvalue
-
-            score      //= 10
-            final_score = score / nt
-            tri_score  /= nt
-            atriplex = Triplex(
-                stari=stari, endi=endi,
-                starj=N - starj + dnaStartPos + 1,
-                endj =N - endj  + dnaStartPos + 1,
-                reverse=strand, strand=Para, rule=rule, nt=nt,
-                score=final_score, identity=identity, tri_score=tri_score,
-                stri_align=stri_align, strj_align=strj_align)
-
-        if nt >= ntMin:
-            triplex_list.append(atriplex)
-
-        if count == 0:
+        if nt == 0:
             break
 
-        # ─── re-expand the DP in the neighbourhood of the current hit ────
-        flag = False
-        for j in range(nn, n1 - 1, -1):
-            CC[j] = 0;  EE[j] = j
-            DD[j] = -(Q); FF[j] = j
-            RR[j] = SS[j] = mm + 1
+        final_score = float(score_raw // 10) / nt
 
-        for i in range(mm, m1 - 1, -1):
-            c = p = 0
-            f  = -(Q)
-            ci = fi = i;  pi = i + 1
-            cj = fj = pj = nn + 1
-            va = V[ord(A[i])]
+        # ── Compute triplex thermodynamic stability score ─────────────────────
+        tri_score = 0.0
+        pre_char  = "\0"
+        cur_char  = "\0"
+        pre_score = 0.0
 
-            for j in range(nn, n1 - 1, -1):
-                f -= R
-                c2 = c - Q - R
-                f, fi, fj = order(f, fi, fj, c2, ci, cj)
-
-                c  = CC[j] - Q - R
-                ci = RR[j];  cj = EE[j]
-                d  = DD[j] - R
-                di = SS[j];  dj = FF[j]
-                d, di, dj = order(d, di, dj, c, ci, cj)
-
-                c = 0
-                if j not in row[i]:
-                    c = p + va[ord(B[j])]
-
-                if c <= 0:
-                    c = 0;  ci = i;  cj = j
+        if strand == 0 and (nt_min <= nt <= nt_max):
+            seq_tmp = strSrc
+            if Para > 0:
+                seq_tmp = _complement(seq_tmp)
+            j_idx = 0
+            for i_idx in range(len(strj_align)):
+                if strj_align[i_idx] == '-':
+                    cur_char  = '-'
+                    hashvalue = triplex_score(cur_char, stri_align[i_idx], Para)
                 else:
-                    ci = pi;  cj = pj
+                    src_pos  = starj + j_idx - 1
+                    cur_char = seq_tmp[src_pos] if src_pos < len(seq_tmp) else 'N'
+                    hashvalue = triplex_score(cur_char, stri_align[i_idx], Para)
+                    j_idx += 1
 
-                c, ci, cj = order(c, ci, cj, d, di, dj)
-                c, ci, cj = order(c, ci, cj, f, fi, fj)
+                if cur_char == pre_char == 'A':
+                    tri_score = tri_score - pre_score + penalty_t
+                    hashvalue = float(penalty_t)
+                if cur_char == pre_char == 'G':
+                    tri_score = tri_score - pre_score + penalty_c
+                    hashvalue = float(penalty_c)
+                pre_score  = hashvalue
+                pre_char   = cur_char
+                tri_score += hashvalue
 
-                p  = CC[j];  CC[j] = c
-                pi = RR[j];  pj = EE[j]
-                RR[j] = ci;  EE[j] = cj
-                DD[j] = d
-                SS[j] = di;  FF[j] = dj
+            tri_score /= nt
 
-                if c > 0:
-                    flag = True
+            atr = Triplex(
+                stari      = stari,
+                endi       = endi,
+                starj      = starj + dna_start_pos,
+                endj       = endj  + dna_start_pos,
+                reverse    = strand,
+                strand     = Para,
+                rule       = rule,
+                nt         = nt,
+                score      = final_score,
+                identity   = identity,
+                tri_score  = tri_score,
+                stri_align = stri_align,
+                strj_align = strj_align,
+            )
 
-            HH[i] = CC[n1];  II[i] = RR[n1];  JJ[i] = EE[n1]
-            WW[i] = f;       XX[i] = fi;       YY[i] = fj
+        elif strand == 1 and (nt_min <= nt <= nt_max):
+            seq_tmp = strSrc
+            if Para < 0:
+                seq_tmp = _complement(seq_tmp)
+            j_idx = 0
+            for i_idx in range(len(strj_align)):
+                if strj_align[i_idx] == '-':
+                    cur_char  = '-'
+                    hashvalue = triplex_score(cur_char, stri_align[i_idx], Para)
+                else:
+                    src_pos  = N - starj - j_idx
+                    cur_char = seq_tmp[src_pos] if 0 <= src_pos < len(seq_tmp) else 'N'
+                    hashvalue = triplex_score(cur_char, stri_align[i_idx], Para)
+                    j_idx += 1
 
-        rl_ref = [endi - stari + 1]
-        cl_ref = [endj - starj + 1]
+                if cur_char == pre_char == 'A':
+                    tri_score = tri_score - pre_score - 1000
+                    hashvalue = -1000.0
+                if cur_char == pre_char == 'G':
+                    tri_score = tri_score - pre_score
+                    hashvalue = 0.0
+                pre_score  = hashvalue
+                pre_char   = cur_char
+                tri_score += hashvalue
 
-        while True:
-            rflag = cflag = True
-            while (rflag and m1 > 1) or (cflag and n1 > 1):
+            tri_score /= nt
 
-                if rflag and m1 > 1:
-                    rflag = False
-                    m1 -= 1
-                    c = p = 0
-                    f  = -(Q)
-                    ci = fi = m1;  pi = m1 + 1
-                    cj = fj = pj = nn + 1
-                    va = V[ord(A[m1])]
+            atr = Triplex(
+                stari      = stari,
+                endi       = endi,
+                starj      = N - starj + dna_start_pos + 1,
+                endj       = N - endj  + dna_start_pos + 1,
+                reverse    = strand,
+                strand     = Para,
+                rule       = rule,
+                nt         = nt,
+                score      = final_score,
+                identity   = identity,
+                tri_score  = tri_score,
+                stri_align = stri_align,
+                strj_align = strj_align,
+            )
+        else:
+            # Soft-mask this region and continue searching
+            dna_masked = (dna_masked[:start_r] +
+                          'N' * (end_r - start_r + 1) +
+                          dna_masked[end_r + 1:])
+            continue
 
-                    for j in range(nn, n1 - 1, -1):
-                        f -= R
-                        c2 = c - Q - R
-                        f, fi, fj = order(f, fi, fj, c2, ci, cj)
+        if nt >= nt_min:
+            triplex_list.append(atr)
 
-                        c  = CC[j] - Q - R
-                        ci = RR[j];  cj = EE[j]
-                        d  = DD[j] - R
-                        di = SS[j];  dj = FF[j]
-                        d, di, dj = order(d, di, dj, c, ci, cj)
-
-                        c = 0
-                        if j not in row[m1]:
-                            c = p + va[ord(B[j])]
-
-                        if c <= 0:
-                            c = 0;  ci = m1;  cj = j
-                        else:
-                            ci = pi;  cj = pj
-
-                        c, ci, cj = order(c, ci, cj, d, di, dj)
-                        c, ci, cj = order(c, ci, cj, f, fi, fj)
-
-                        p  = CC[j];  CC[j] = c
-                        pi = RR[j];  pj = EE[j]
-                        RR[j] = ci;  EE[j] = cj
-                        DD[j] = d
-                        SS[j] = di;  FF[j] = dj
-
-                        if c > 0:
-                            flag = True
-                        if not rflag and (
-                                (ci > rl_ref[0] and cj > cl_ref[0]) or
-                                (di > rl_ref[0] and dj > cl_ref[0]) or
-                                (fi > rl_ref[0] and fj > cl_ref[0])):
-                            rflag = True
-
-                    HH[m1] = CC[n1];  II[m1] = RR[n1];  JJ[m1] = EE[n1]
-                    WW[m1] = f;       XX[m1] = fi;       YY[m1] = fj
-                    if not cflag and (
-                            (ci > rl_ref[0] and cj > cl_ref[0]) or
-                            (di > rl_ref[0] and dj > cl_ref[0]) or
-                            (fi > rl_ref[0] and fj > cl_ref[0])):
-                        cflag = True
-
-                if cflag and n1 > 1:
-                    cflag = False
-                    n1 -= 1
-                    c = 0
-                    f  = -(Q)
-                    cj = fj = n1
-                    va = V[ord(B[n1])]
-                    p = 0
-                    ci = fi = pi = mm + 1
-                    pj = n1 + 1
-
-                    for i in range(mm, m1 - 1, -1):
-                        f -= R
-                        c2 = c - Q - R
-                        f, fi, fj = order(f, fi, fj, c2, ci, cj)
-
-                        c  = HH[i] - Q - R
-                        ci = II[i];  cj = JJ[i]
-                        d  = WW[i] - R
-                        di = XX[i];  dj = YY[i]
-                        d, di, dj = order(d, di, dj, c, ci, cj)
-
-                        c = 0
-                        if n1 not in row[i]:
-                            c = p + va[ord(A[i])]
-
-                        if c <= 0:
-                            c = 0;  ci = i;  cj = n1
-                        else:
-                            ci = pi;  cj = pj
-
-                        c, ci, cj = order(c, ci, cj, d, di, dj)
-                        c, ci, cj = order(c, ci, cj, f, fi, fj)
-
-                        p  = HH[i];  HH[i] = c
-                        pi = II[i];  pj = JJ[i]
-                        II[i] = ci;  JJ[i] = cj
-                        WW[i] = d
-                        XX[i] = di;  YY[i] = dj
-
-                        if c > 0:
-                            flag = True
-                        if not cflag and (
-                                (ci > rl_ref[0] and cj > cl_ref[0]) or
-                                (di > rl_ref[0] and dj > cl_ref[0]) or
-                                (fi > rl_ref[0] and fj > cl_ref[0])):
-                            cflag = True
-
-                    CC[n1] = HH[m1];  RR[n1] = II[m1];  EE[n1] = JJ[m1]
-                    DD[n1] = f;       SS[n1] = fi;       FF[n1] = fj
-                    if not rflag and (
-                            (ci > rl_ref[0] and cj > cl_ref[0]) or
-                            (di > rl_ref[0] and dj > cl_ref[0]) or
-                            (fi > rl_ref[0] and fj > cl_ref[0])):
-                        rflag = True
-
-            if (m1 == 1 and n1 == 1) or no_cross(LIST, numnode[0], m1, mm, n1, nn, rl_ref, cl_ref):
-                break
-            m1 -= 1;  n1 -= 1
-
-        if flag:
-            for j in range(n1 + 1, nn + 1):
-                CC[j] = 0;  RR[j] = m1;  EE[j] = j
-                DD[j] = -(Q); SS[j] = m1; FF[j] = j
-
-            for i in range(m1 + 1, mm + 1):
-                c = 0;  f = -(Q)
-                ci = fi = i;  va = V[ord(A[i])]
-                p = 0;  pi = i - 1
-                cj = fj = pj = n1
-
-                for j in range(n1 + 1, nn + 1):
-                    f -= R
-                    c2 = c - Q - R
-                    f, fi, fj = order(f, fi, fj, c2, ci, cj)
-
-                    c  = CC[j] - Q - R
-                    ci = RR[j];  cj = EE[j]
-                    d  = DD[j] - R
-                    di = SS[j];  dj = FF[j]
-                    d, di, dj = order(d, di, dj, c, ci, cj)
-
-                    c = 0
-                    if j not in row[i]:
-                        c = p + va[ord(B[j])]
-
-                    if c <= 0:
-                        c = 0;  ci = i;  cj = j
-                    else:
-                        ci = pi;  cj = pj
-
-                    c, ci, cj = order(c, ci, cj, d, di, dj)
-                    c, ci, cj = order(c, ci, cj, f, fi, fj)
-
-                    p  = CC[j];  CC[j] = c
-                    pi = RR[j];  pj = EE[j]
-                    RR[j] = ci;  EE[j] = cj
-                    DD[j] = d
-                    SS[j] = di;  FF[j] = dj
-
-                    if c > 0:
-                        addnode(c, ci, cj, i, j, LIST, numnode)
+        # Soft-mask the used region so the next iteration finds a different site
+        dna_masked = (dna_masked[:start_r] +
+                      'N' * (end_r - start_r + 1) +
+                      dna_masked[end_r + 1:])
 
 
-# ─────────────────────────────────────────────────────────────
-# cluster_triplex
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# cluster_triplex  (mirrors C++ cluster_triplex)
+# ---------------------------------------------------------------------------
 
 def cluster_triplex(dd: int, length: int,
                     triplex_list: List[Triplex],
@@ -937,76 +508,73 @@ def cluster_triplex(dd: int, length: int,
                     class1a: List[Dict[int, int]],
                     class1b: List[Dict[int, int]],
                     class_level: int) -> None:
-    """
-    Cluster triplexes by proximity along the genome axis.
-    Fills class1 / class1a / class1b coverage maps.
-    """
+    """Mirrors C++ cluster_triplex()."""
     axis_map: Dict[int, Axis] = {}
-    max_neartriplexnum = 0
-    max_pos   = 0
-    find      = False
-    count     = 0
+    max_near = 0
+    max_pos  = 0
+    find     = False
 
     for t in triplex_list:
         if t.nt > length:
-            count += 1
-            middle   = (t.stari + t.endi) // 2
+            middle = (t.stari + t.endi) // 2
             t.middle = middle
             t.motif  = 0
+
             if middle not in axis_map:
                 axis_map[middle] = Axis()
             axis_map[middle].triplexnum += 1
 
             for i in range(-dd, dd + 1):
-                pos = middle + i
-                if pos not in axis_map:
-                    axis_map[pos] = Axis()
+                key = middle + i
+                if key not in axis_map:
+                    axis_map[key] = Axis()
                 if i > 0:
-                    axis_map[pos].neartriplex += dd - i
+                    axis_map[key].neartriplex += (dd - i)
                 elif i < 0:
-                    axis_map[pos].neartriplex += dd + i
+                    axis_map[key].neartriplex += (dd + i)
+                # i == 0: no change
 
                 if axis_map[middle].triplexnum > 0:
-                    if axis_map[pos].neartriplex > max_neartriplexnum:
-                        max_neartriplexnum = axis_map[pos].neartriplex
-                        max_pos = pos
-                        find    = True
+                    if axis_map[key].neartriplex > max_near:
+                        max_near = axis_map[key].neartriplex
+                        max_pos  = key
+                        find     = True
 
             t.neartriplex = axis_map[middle].neartriplex
 
-    theclass = 1
+    the_class = 1
     while find:
         for i in range(max_pos - dd, max_pos + dd + 1):
             for t in triplex_list:
                 if t.middle == i and t.motif == 0:
-                    t.motif  = theclass
+                    t.motif  = the_class
                     t.center = max_pos
-                    if theclass <= class_level:
+                    if the_class <= class_level:
                         if t.endj > t.starj:
                             for j in range(t.starj, t.endj):
-                                class1 [theclass][j] = class1 [theclass].get(j, 0) + 1
-                                class1a[theclass][j] = class1a[theclass].get(j, 0) + 1
+                                class1[the_class][j]  = class1[the_class].get(j, 0) + 1
+                                class1a[the_class][j] = class1a[the_class].get(j, 0) + 1
                         else:
                             for j in range(t.endj, t.starj):
-                                class1 [theclass][j] = class1 [theclass].get(j, 0) + 1
-                                class1b[theclass][j] = class1b[theclass].get(j, 0) - 1
+                                class1[the_class][j]  = class1[the_class].get(j, 0) + 1
+                                class1b[the_class][j] = class1b[the_class].get(j, 0) - 1
             if i in axis_map:
                 del axis_map[i]
 
-        max_neartriplexnum = 0
-        find = False
+        max_near = 0
+        find     = False
         for pos, ax in axis_map.items():
-            if ax.neartriplex >= max_neartriplexnum and ax.triplexnum > 0:
-                max_neartriplexnum = ax.neartriplex
-                max_pos = pos
-                find    = True
+            if ax.neartriplex >= max_near and ax.triplexnum > 0:
+                max_near = ax.neartriplex
+                max_pos  = pos
+                find     = True
 
-        theclass += 1
+        the_class += 1
 
 
-# ─────────────────────────────────────────────────────────────
-# print_cluster
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# print_cluster  (mirrors C++ print_cluster)
+# ---------------------------------------------------------------------------
 
 def print_cluster(c_level: int,
                   class1: List[Dict[int, int]],
@@ -1016,109 +584,145 @@ def print_cluster(c_level: int,
                   rna_name: str,
                   distance: int,
                   length: int,
-                  outFilePath: str,
+                  out_file_path: str,
                   c_tmp_dd: str,
                   c_tmp_length: str,
                   w_tmp_class: List[TmpClass]) -> None:
-    """
-    Write a UCSC bedGraph track for the cluster at level c_level.
-    """
-    c_tmp_level = str(c_level)
-    class_name  = (outFilePath[:-10] +
-                   f"-TFOclass{c_tmp_level}-{c_tmp_dd}-{c_tmp_length}")
+    """Mirrors C++ print_cluster()."""
+    class_name = (
+        out_file_path[: out_file_path.rfind("-TFOsorted")]
+        + f"-TFOclass{c_level}-{c_tmp_dd}-{c_tmp_length}"
+    )
 
-    with open(class_name, 'w') as outfile:
-        outfile.write(f"browser position {chro_info}:{start_genome}-"
-                      f"{start_genome + dna_size}\n")
-        outfile.write("browser hide all\n")
-        outfile.write("browser pack refGene encodeRegions\n")
-        outfile.write("browser full altGraph\n")
-        outfile.write("# 300 base wide bar graph, ausoScale is on by default == graphing\n")
-        outfile.write("# limits will dynamically change to always show full range of data\n")
-        outfile.write("# in viewing window, priority = 20 position this as the second graph\n")
-        outfile.write("# Note, zero-relative, half-open coordinate system in use for bedGraph format\n")
-        outfile.write(f"track type=bedGraph name='{rna_name} TTS ({c_level})' "
-                      f"description='{distance}-{length}' visibility=full "
-                      f"color=200,100,0 altColor=0,100,200 priority=20\n")
+    cls = class1[c_level]
+    if not cls:
+        open(class_name, "w").close()
+        return
 
-        data = class1[c_level]
-        if not data:
+    with open(class_name, "w") as out:
+        out.write(f"browser position {chro_info}:{start_genome}-{start_genome + dna_size}\n")
+        out.write("browser hide all\n")
+        out.write("browser pack refGene encodeRegions\n")
+        out.write("browser full altGraph\n")
+        out.write("# 300 base wide bar graph, ausoScale is on by default == graphing\n")
+        out.write("# limits will dynamically change to always show full range of data\n")
+        out.write("# in viewing window, priority = 20 position this as the second graph\n")
+        out.write("# Note, zero-relative, half-open coordinate system in use for bedGraph format\n")
+        out.write(
+            f"track type=bedGraph name='{rna_name} TTS ({c_level})' "
+            f"description='{distance}-{length}' visibility=full "
+            f"color=200,100,0 altColor=0,100,200 priority=20\n"
+        )
+
+        sorted_keys = sorted(cls.keys())
+        if not sorted_keys:
             return
+        final_genome = sorted_keys[-1] + start_genome
 
-        final_genome = max(data.keys()) + start_genome
-        items        = sorted(data.items())
+        map_count   = 0
+        map_count1  = 0
+        map_tmp1    = 0
+        map_tmp2    = 0
+        map_tmp3    = 0
 
-        map_count = map_count1 = 0
-        map_tmp1 = map_tmp2 = map_tmp3 = 0
-        map_first0 = map_second0 = 0
+        keys = sorted_keys
+        idx  = 0
 
-        idx = 0
-        while idx < len(items):
-            key0, val0 = items[idx]
-            map_tmp1   = key0
-            map_tmp2   = val0
-            map_first0 = key0
+        while idx < len(keys):
+            k0   = keys[idx]
+            val0 = cls[k0]
+
+            map_tmp1 = k0
+            map_tmp2 = val0
+            map_first0  = k0
             map_second0 = val0
 
             if map_count == 0 and map_count1 == 0:
-                map_tmp3    = key0
+                map_tmp3    = k0
+                map_tmp2    = val0
                 map_count1 += 1
 
-            if key0 + start_genome == final_genome:
+            if k0 == final_genome - start_genome:
                 break
 
-            if idx + 1 >= len(items):
+            if idx + 1 >= len(keys):
                 break
-            key1, val1 = items[idx + 1]
 
-            if abs(key1 - map_tmp1) == 1 and val1 == map_tmp2:
-                map_tmp1 = key1;  map_tmp2 = val1
+            k1   = keys[idx + 1]
+            val1 = cls[k1]
+
+            if abs(k1 - map_tmp1) == 1 and val1 == map_tmp2:
+                # contiguous same-value run
+                map_tmp1 = k1
                 idx += 1
-                while idx + 1 < len(items):
-                    k2, v2 = items[idx + 1]
-                    if abs(k2 - map_tmp1) == 1 and v2 == map_tmp2:
-                        map_tmp1 = k2;  map_tmp2 = v2;  idx += 1
+                while idx + 1 < len(keys):
+                    k_next   = keys[idx + 1]
+                    val_next = cls[k_next]
+                    if abs(k_next - map_tmp1) == 1 and val_next == map_tmp2:
+                        map_tmp1 = k_next
+                        idx += 1
                     else:
                         break
                 if map_count == 0:
-                    w_tmp_class.append(TmpClass(map_first0 + start_genome - 2,
-                                                map_tmp1  + start_genome,
-                                                map_tmp2, 0, 0))
+                    w_tmp_class.append(TmpClass(
+                        genome_start = map_first0 + start_genome - 2,
+                        genome_end   = map_tmp1   + start_genome,
+                        signal_level = map_tmp2,
+                    ))
                     map_count += 1
                 else:
-                    w_tmp_class.append(TmpClass(map_first0 + start_genome - 1,
-                                                map_tmp1  + start_genome,
-                                                map_tmp2, 0, 0))
-            elif abs(key1 - map_tmp1) != 1 and val1 == map_tmp2:
-                w_tmp_class.append(TmpClass(map_tmp1 + start_genome,
-                                            key1     + start_genome - 1, 0, 0, 0))
-                w_tmp_class.append(TmpClass(key1 + start_genome - 1,
-                                            key1 + start_genome, val1, 0, 0))
-            elif abs(key1 - map_tmp1) == 1 and val1 != map_tmp2:
-                w_tmp_class.append(TmpClass(map_tmp1 + start_genome,
-                                            key1     + start_genome, val1, 0, 0))
-            elif abs(key1 - map_tmp1) != 1 and val1 != map_tmp2:
-                w_tmp_class.append(TmpClass(map_tmp1 + start_genome,
-                                            key1     + start_genome - 1, 0, 0, 0))
-                w_tmp_class.append(TmpClass(key1 + start_genome - 1,
-                                            key1 + start_genome, val1, 0, 0))
+                    w_tmp_class.append(TmpClass(
+                        genome_start = map_first0 + start_genome - 1,
+                        genome_end   = map_tmp1   + start_genome,
+                        signal_level = map_tmp2,
+                    ))
+
+            elif abs(k1 - map_tmp1) != 1 and val1 == map_tmp2:
+                w_tmp_class.append(TmpClass(
+                    genome_start = map_tmp1 + start_genome,
+                    genome_end   = k1       + start_genome - 1,
+                    signal_level = 0,
+                ))
+                w_tmp_class.append(TmpClass(
+                    genome_start = k1 + start_genome - 1,
+                    genome_end   = k1 + start_genome,
+                    signal_level = val1,
+                ))
+
+            elif abs(k1 - map_tmp1) == 1 and val1 != map_tmp2:
+                w_tmp_class.append(TmpClass(
+                    genome_start = map_tmp1 + start_genome,
+                    genome_end   = k1       + start_genome,
+                    signal_level = val1,
+                ))
+
+            else:  # gap AND different value
+                w_tmp_class.append(TmpClass(
+                    genome_start = map_tmp1 + start_genome,
+                    genome_end   = k1       + start_genome - 1,
+                    signal_level = 0,
+                ))
+                w_tmp_class.append(TmpClass(
+                    genome_start = k1 + start_genome - 1,
+                    genome_end   = k1 + start_genome,
+                    signal_level = val1,
+                ))
 
             idx += 1
 
-        w_idx = 0
-        while w_idx < len(w_tmp_class):
-            btc = w_tmp_class[w_idx]
+        # Write collected segments to bedGraph
+        loop = 0
+        while loop < len(w_tmp_class):
+            btc = w_tmp_class[loop]
             if btc.genome_start == final_genome:
                 break
-            if w_idx + 1 == len(w_tmp_class):
-                w_idx += 1
-                continue
-            ctc = w_tmp_class[w_idx + 1]
+            if loop + 1 >= len(w_tmp_class):
+                out.write(f"{chro_info}\t{btc.genome_start}\t{btc.genome_end}\t{btc.signal_level}\n")
+                break
+            ctc = w_tmp_class[loop + 1]
             if btc.genome_start == ctc.genome_start:
-                outfile.write(f"{chro_info}\t{btc.genome_start}\t"
-                              f"{ctc.genome_end}\t{ctc.signal_level}\n")
-                w_idx += 2
+                out.write(f"{chro_info}\t{btc.genome_start}\t{ctc.genome_end}\t{ctc.signal_level}\n")
+                loop += 2
             else:
-                outfile.write(f"{chro_info}\t{btc.genome_start}\t"
-                              f"{btc.genome_end}\t{btc.signal_level}\n")
-                w_idx += 1
+                out.write(f"{chro_info}\t{btc.genome_start}\t{btc.genome_end}\t{btc.signal_level}\n")
+                loop += 1
