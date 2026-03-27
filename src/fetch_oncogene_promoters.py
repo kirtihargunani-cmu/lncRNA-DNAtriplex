@@ -365,11 +365,11 @@ def resolve_coordinates(symbols: list[str]) -> dict[str, dict]:
 def fetch_upstream(chrom: str, tss: int, strand: str,
                    upstream: int, genome: str) -> str | None:
     if strand == "+":
-        seq_start = max(0, tss - upstream)
-        seq_end   = tss
+        seq_start = max(0, tss - 2000)
+        seq_end   = tss + 2000          # 2kb downstream into gene body
     else:
-        seq_start = tss
-        seq_end   = tss + upstream
+        seq_start = tss - 2000          # 2kb into gene body
+        seq_end   = tss + 2000
 
     if seq_start >= seq_end:
         return None
