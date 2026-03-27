@@ -1,0 +1,12 @@
+# Jupyter
+.ipynb_checkpoints/
+src/.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+src/__pycache__/
+*.pyc
+
+# Data
+data/
+
