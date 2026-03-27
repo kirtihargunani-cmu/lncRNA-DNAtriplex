@@ -6,29 +6,16 @@ Wires together:
   stats.py      → calc_score
   sim.py        → SIM, Triplex, cluster_triplex, print_cluster
   data_loader.py→ load_mutations, load_chrom_map,
-                  load_healthy_sequences, load_lncrnas
+                  load_sequences, load_lncrnas
 
 Usage:
   python alignment.py \
-    --genome      GCF_000001405.40_GRCh38.p14_genomic.fna.gz \
-    --annotation  GCF_000001405.40_GRCh38.p14_genomic.gtf.gz \
-    --assembly    GCF_000001405.40_GRCh38.p14_assembly_report.txt \
-    --mutations   ucec_msk_2024/data_mutations.txt \
+    --genome      genomic.fna.gz \
+    --annotation  genomic.gtf.gz \
+    --assembly    assembly_report.txt \
+    --mutations   data_mutations.txt \
     --lncrna      lncipedia_5_2_hc.fasta \
     --outpath     ./results
-
-Dictionary schemas (from data_loader.py)
------------------------------------------
-mutated_dict  = {
-    Hugo_Symbol: {
-        "entrez_id":  int | None,
-        "chromosome": str,
-        "mutations":  [{"start", "end", "consequence",
-                        "variant_class", "variant_type"}, ...]
-    }
-}
-healthy_dict  = { Hugo_Symbol:   sequence_str }
-lncrna_dict   = { transcript_id: sequence_str }
 """
 
 import sys
@@ -43,7 +30,7 @@ from rules       import transfer_string, reverse_seq, complement
 from stats       import calc_score
 from sim         import SIM, Triplex, cluster_triplex, print_cluster
 from data_loader import (load_mutations, load_chrom_map,
-                         load_healthy_sequences, load_lncrnas)
+                         load_sequences, load_lncrnas)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,7 +175,7 @@ def long_target(para: Para, rna_sequence: str,
 
 def report(
     results:      Dict[str, Dict[str, Dict[str, List[Triplex]]]],
-    mutated_dict: Dict,
+    mutations_dict: Dict,
     outpath:      str,
     report_name:  str = None,
 ) -> None:
@@ -215,7 +202,7 @@ def report(
     rows = []
     for lnc_id, gene_dict in results.items():
         for gene, condition_dict in gene_dict.items():
-            gene_info  = mutated_dict.get(gene, {})
+            gene_info  = mutations_dict.get(gene, {})
             chromosome = gene_info.get("chromosome", "")
             mutations  = {
                 f"mut{i}_{m.get('variant_class', 'unknown')}": m.get("variant_class", "")
@@ -331,33 +318,34 @@ def main(argv: List[str] = None) -> int:
 
     # ── load dictionaries ─────────────────────────────────────────────────
     print("Loading mutated gene data ...")
-    mutated_dict, gene_names = load_mutations(args.mutations)
+    mutations_dict, gene_names = load_mutations(args.mutations)
 
     print("Building chromosome map ...")
     chrom_map = load_chrom_map(args.assembly)
 
-    print("Loading healthy reference sequences ...")
-    healthy_dict = load_healthy_sequences(
-        fasta_path = args.genome,
-        gtf_path   = args.annotation,
-        gene_names = gene_names,
-        chrom_map  = chrom_map,
+    print("Loading gene sequences ...")
+    healthy_seqs_dict, mutated_seqs_dict = load_sequences(
+        fasta_path     = args.genome,
+        gtf_path       = args.annotation,
+        gene_names     = gene_names,
+        chrom_map      = chrom_map,
+        mutations_dict = mutations_dict,
     )
 
     print("Loading lncRNA sequences ...")
-    lncrna_dict = load_lncrnas(args.lncrna)
+    lncrna_seqs_dict = load_lncrnas(args.lncrna)
 
     print(f"\n=== Data Summary ===")
-    print(f"  Mutated genes:    {len(mutated_dict)}")
-    print(f"  Healthy seqs:     {len(healthy_dict)}")
-    print(f"  lncRNA entries:   {len(lncrna_dict)}")
+    print(f"  Genes with mutations:     {len(mutations_dict)}")
+    print(f"  Gene sequences retrieved: {len(healthy_seqs_dict)}")
+    print(f"  lncRNA transcripts:       {len(lncrna_seqs_dict)}")
 
     # ── prepare gene/lncRNA lists ─────────────────────────────────────────
-    shared_genes = sorted(g for g in gene_names if g in healthy_dict)
-    lncrna_ids   = list(lncrna_dict.keys())
+    shared_genes = sorted(g for g in gene_names if g in healthy_seqs_dict)
+    lncrna_ids   = list(lncrna_seqs_dict.keys())
 
-    TEST_LNCRNA  = 100
-    test_lncrnas = lncrna_ids[:TEST_LNCRNA]
+    n_test  = 100
+    test_lncrnas = lncrna_ids[:n_test]
 
     print(f"\n  Genes available for analysis: {len(shared_genes)}")
     print(f"  lncRNAs to test:              {len(test_lncrnas)}")
@@ -373,14 +361,15 @@ def main(argv: List[str] = None) -> int:
     total_hits  = 0
 
     for lnc_idx, lnc_id in enumerate(test_lncrnas):
-        lnc_seq = lncrna_dict[lnc_id]
+        lnc_seq = lncrna_seqs_dict[lnc_id]
         print(f"[{lnc_idx + 1}/{len(test_lncrnas)}] lncRNA: {lnc_id} "
               f"({len(lnc_seq)} nt)")
         results[lnc_id] = {}
 
         for gene in shared_genes:
-            healthy_seq = healthy_dict[gene]
-            gene_info   = mutated_dict[gene]
+            healthy_seq  = healthy_seqs_dict[gene]
+            gene_muts    = mutations_dict[gene]["mutations"]
+            mut_seqs     = mutated_seqs_dict.get(gene, [])
             results[lnc_id][gene] = {}
 
             # ── healthy run ───────────────────────────────────────────────
@@ -389,9 +378,11 @@ def main(argv: List[str] = None) -> int:
             total_hits += len(healthy_triplexes)
 
             # ── mutated runs ──────────────────────────────────────────────
-            for mut_idx, mut in enumerate(gene_info.get("mutations", [])):
+            for mut_idx, (mut, mutated_seq) in enumerate(zip(gene_muts, mut_seqs)):
+                if mutated_seq is None:
+                    continue
                 mut_label = f"mut{mut_idx}_{mut.get('variant_class', 'unknown')}"
-                mutated_triplexes = long_target(para, lnc_seq, healthy_seq)
+                mutated_triplexes = long_target(para, lnc_seq, mutated_seq)
                 results[lnc_id][gene][mut_label] = mutated_triplexes
                 total_hits += len(mutated_triplexes)
 
@@ -406,7 +397,7 @@ def main(argv: List[str] = None) -> int:
     print(f"Total triplex hits across all runs:     {total_hits}")
 
     # ── write report ──────────────────────────────────────────────────────
-    report(results, mutated_dict, args.outpath)
+    report(results, mutations_dict, args.outpath)
 
     print("\nFinished normally.")
     return 0
